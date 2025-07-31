@@ -18,6 +18,7 @@ from PIL import Image
 from utils.general_utils import PILtoTorch
 import os, cv2
 import torch.nn.functional as F
+import torchvision
 
 def dilate(bin_img, ksize=6):
     pad = (ksize - 1) // 2
@@ -29,12 +30,25 @@ def erode(bin_img, ksize=12):
     out = 1 - dilate(1 - bin_img, ksize)
     return out
 
-def process_image(image_path, resolution, ncc_scale):
+def process_image(image_path, resolution, ncc_scale, depth_path, conf_path, normal_path, stable_normal_path):
     image = Image.open(image_path)
+    depth, conf, normal = None, None, None
+    stable_normal = None
+    resized_stable_normal = None
+    if depth_path is not None:
+        depth = torch.load(depth_path, weights_only=True).float() # (1 , H,  W)
+    if conf_path is not None:
+        conf = torch.load(conf_path, weights_only=True).float() # (1,  H,  W)
+    if normal_path is not None:
+        normal = torch.load(normal_path, weights_only=True).float() # (3,  H,  W)
+    if stable_normal_path is not None:
+        stable_normal = Image.open(stable_normal_path)
     if len(image.split()) > 3:
         resized_image_rgb = torch.cat([PILtoTorch(im, resolution) for im in image.split()[:3]], dim=0)
         loaded_mask = PILtoTorch(image.split()[3], resolution)
         gt_image = resized_image_rgb
+        # gt_image[loaded_mask.repeat((3, 1, 1)) == 0] = 0.0
+            
         if ncc_scale != 1.0:
             ncc_resolution = (int(resolution[0]/ncc_scale), int(resolution[1]/ncc_scale))
             resized_image_rgb = torch.cat([PILtoTorch(im, ncc_resolution) for im in image.split()[:3]], dim=0)
@@ -45,12 +59,52 @@ def process_image(image_path, resolution, ncc_scale):
         if ncc_scale != 1.0:
             ncc_resolution = (int(resolution[0]/ncc_scale), int(resolution[1]/ncc_scale))
             resized_image_rgb = PILtoTorch(image, ncc_resolution)
+    C, H, W = gt_image.shape
+    resize = torchvision.transforms.Resize((H, W), interpolation=torchvision.transforms.InterpolationMode.BICUBIC)
+    # resize_normal = torchvision.transforms.Resize((H, W), interpolation=torchvision.transforms.InterpolationMode.NEAREST)
+    if depth is not None:
+        depth = resize(depth)
+        if loaded_mask is not None:
+            depth[loaded_mask == 0] = -1
+    if normal is not None:
+        normal = resize(normal)
+        normal /= normal.norm(dim=0, keepdim=True)
+
+    if conf is not None:
+        conf = resize(conf)
+        conf = (conf - conf.min()) / (conf.max() - conf.min())
+        if loaded_mask is not None:
+            conf[loaded_mask == 0] = 0.0
+    if stable_normal is not None:
+        resized_stable_normal = PILtoTorch(stable_normal, resolution)
+        if ncc_scale != 1.0:
+            resized_stable_normal = PILtoTorch(stable_normal, ncc_resolution)
+        
     gray_image = (0.299 * resized_image_rgb[0] + 0.587 * resized_image_rgb[1] + 0.114 * resized_image_rgb[2])[None]
-    return gt_image, gray_image, loaded_mask
+    return gt_image, gray_image, loaded_mask, depth, conf, normal, resized_stable_normal
+
+# def process_image(image_path, resolution, ncc_scale):
+#     image = Image.open(image_path)
+#     if len(image.split()) > 3:
+#         resized_image_rgb = torch.cat([PILtoTorch(im, resolution) for im in image.split()[:3]], dim=0)
+#         loaded_mask = PILtoTorch(image.split()[3], resolution)
+#         gt_image = resized_image_rgb
+#         if ncc_scale != 1.0:
+#             ncc_resolution = (int(resolution[0]/ncc_scale), int(resolution[1]/ncc_scale))
+#             resized_image_rgb = torch.cat([PILtoTorch(im, ncc_resolution) for im in image.split()[:3]], dim=0)
+#     else:
+#         resized_image_rgb = PILtoTorch(image, resolution)
+#         loaded_mask = None
+#         gt_image = resized_image_rgb
+#         if ncc_scale != 1.0:
+#             ncc_resolution = (int(resolution[0]/ncc_scale), int(resolution[1]/ncc_scale))
+#             resized_image_rgb = PILtoTorch(image, ncc_resolution)
+#     gray_image = (0.299 * resized_image_rgb[0] + 0.587 * resized_image_rgb[1] + 0.114 * resized_image_rgb[2])[None]
+#     return gt_image, gray_image, loaded_mask
 
 class Camera(nn.Module):
     def __init__(self, colmap_id, R, T, FoVx, FoVy,
-                 image_width, image_height,
+                 image_width, image_height, image,
                  image_path, image_name, uid,
                  trans=np.array([0.0, 0.0, 0.0]), scale=1.0, 
                  ncc_scale=1.0,
@@ -65,6 +119,7 @@ class Camera(nn.Module):
         self.T = T
         self.FoVx = FoVx
         self.FoVy = FoVy
+        self.image = image
         self.image_name = image_name
         self.image_path = image_path
         self.image_width = image_width
@@ -84,11 +139,44 @@ class Camera(nn.Module):
         self.original_image, self.image_gray, self.mask = None, None, None
         self.preload_img = preload_img
         self.ncc_scale = ncc_scale
+
+        self.depth_path = None
+        self.conf_path = None
+        self.normal_path = None
+        self.stable_normal_path = None
+        folder_name = os.path.dirname(os.path.dirname(os.path.join(self.image_path)))
+        if os.path.exists(os.path.join(folder_name, "depth_vggt")):
+            self.depth_path = os.path.join(folder_name, "depth_vggt", self.image_name + "_depth.pt")
+            self.conf_path = os.path.join(folder_name, "conf_vggt", self.image_name + "_conf.pt")    
+            self.normal_path = os.path.join(folder_name, "normal_vggt", self.image_name + "_normal.pt")    
+        elif os.path.basename(os.path.dirname(image_path)) == "train" and os.path.exists(os.path.join(folder_name, "train_vggt")):
+            self.depth_path = os.path.join(folder_name, "train_vggt", "depth_vggt", self.image_name + "_depth.pt")
+            self.conf_path = os.path.join(folder_name, "train_vggt",  "conf_vggt", self.image_name + "_conf.pt")    
+            self.normal_path = os.path.join(folder_name, "train_vggt", "normal_vggt", self.image_name + "_normal.pt")    
+        elif os.path.basename(os.path.dirname(image_path)) == "test" and os.path.exists(os.path.join(folder_name, "test_vggt")):
+            self.depth_path = os.path.join(folder_name, "test_vggt", "depth_vggt", self.image_name + "_depth.pt")
+            self.conf_path = os.path.join(folder_name, "test_vggt",  "conf_vggt", self.image_name + "_conf.pt")    
+            self.normal_path = os.path.join(folder_name, "test_vggt", "normal_vggt", self.image_name + "_normal.pt")  
+
+        if os.path.exists(os.path.join(folder_name, "stablenormals")):
+            self.stable_normal_path = os.path.join(folder_name, "stablenormals", self.image_name + ".png")
+
+        self.depth, self.conf, self.normal = None, None, None
+        self.stable_normal = None
+
         if self.preload_img:
-            gt_image, gray_image, loaded_mask = process_image(self.image_path, self.resolution, ncc_scale)
+            gt_image, gray_image, loaded_mask, depth, conf, normal, stable_normal = process_image(self.image_path, self.resolution, ncc_scale, self.depth_path, self.conf_path, self.normal_path, self.stable_normal_path)
             self.original_image = gt_image.to(self.data_device)
             self.original_image_gray = gray_image.to(self.data_device)
             self.mask = loaded_mask
+            if depth is not None:
+                self.depth = depth.to(self.data_device)
+            if conf is not None:
+                self.conf = conf.to(self.data_device)
+            if normal is not None:
+                self.normal = normal.to(self.data_device)
+            if stable_normal is not None:
+                self.stable_normal = stable_normal.to(self.data_device)
 
 
         self.zfar = 100.0
@@ -105,10 +193,18 @@ class Camera(nn.Module):
 
     def get_image(self):
         if self.preload_img:
-            return self.original_image.cuda(), self.original_image_gray.cuda()
+            return self.original_image.cuda(), self.original_image_gray.cuda(), self.depth, self.conf, self.normal, self.stable_normal
         else:
-            gt_image, gray_image, _ = process_image(self.image_path, self.resolution, self.ncc_scale)
-            return gt_image.cuda(), gray_image.cuda()
+            gt_image, gray_image, _, depth, conf, normal, stable_normal = process_image(self.image_path, self.resolution, self.ncc_scale, self.depth_path, self.conf_path, self.normal_path, self.stable_normal_path)
+            if depth is not None:
+                depth = depth.to(self.data_device)
+            if conf is not None:
+                conf = conf.to(self.data_device)
+            if normal is not None:
+                normal = normal.to(self.data_device)
+            if stable_normal is not None:
+                stable_normal = stable_normal.to(self.data_device)
+            return gt_image.cuda(), gray_image.cuda(), depth, conf, normal, stable_normal
 
     def get_calib_matrix_nerf(self, scale=1.0):
         intrinsic_matrix = torch.tensor([[self.Fx/scale, 0, self.Cx/scale], [0, self.Fy/scale, self.Cy/scale], [0, 0, 1]]).float()

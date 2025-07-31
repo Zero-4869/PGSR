@@ -38,6 +38,7 @@ cd PGSR
 conda create -n pgsr python=3.8
 conda activate pgsr
 
+conda install pytorch==2.4.1 torchvision==0.19.1 torchaudio==2.4.1 pytorch-cuda=12.1 -c pytorch -c nvidia
 pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu118 #replace your cuda version
 pip install -r requirements.txt
 pip install submodules/diff-plane-rasterization

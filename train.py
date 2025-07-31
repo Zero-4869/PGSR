@@ -17,7 +17,7 @@ import numpy as np
 from random import randint
 from utils.loss_utils import l1_loss, ssim, lncc, get_img_grad_weight
 from utils.graphics_utils import patch_offsets, patch_warp
-from gaussian_renderer import render, network_gui
+from gaussian_renderer import render, network_gui, render_normal
 import sys, time
 from scene import Scene, GaussianModel
 from utils.general_utils import safe_state
@@ -78,6 +78,14 @@ def gen_virtul_cam(cam, trans_noise=1.0, deg_noise=15.0):
                         preload_img=False, data_device = "cuda")
     return virtul_cam
 
+def get_rotation(normal_map_gt, normal_map_vggt):
+    '''
+    min(\sum_{i} \|R@normal_map_vggt[i] - normal_map_gt[i]\|^2)
+    '''
+    denominator = normal_map_vggt.T @ normal_map_vggt
+    nominator = normal_map_vggt.T @ normal_map_gt
+    return torch.linalg.inv(denominator) @ nominator
+
 def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoint_iterations, checkpoint, debug_from):
     first_iter = 0
     tb_writer = prepare_output_and_logger(dataset)
@@ -123,6 +131,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
     debug_path = os.path.join(scene.model_path, "debug")
     os.makedirs(debug_path, exist_ok=True)
 
+    use_mv = True
     for iteration in range(first_iter, opt.iterations + 1):
         # if network_gui.conn == None:
         #     network_gui.try_connect()
@@ -150,7 +159,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
             viewpoint_stack = scene.getTrainCameras().copy()
         viewpoint_cam = viewpoint_stack.pop(randint(0, len(viewpoint_stack)-1))
 
-        gt_image, gt_image_gray = viewpoint_cam.get_image()
+        gt_image, gt_image_gray, depth_vggt, conf_vggt, normal_vggt, stable_normal = viewpoint_cam.get_image()
         if iteration > 1000 and opt.exposure_compensation:
             gaussians.use_app = True
 
@@ -180,20 +189,54 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
             sorted_scale, _ = torch.sort(scale, dim=-1)
             min_scale_loss = sorted_scale[...,0]
             loss += opt.scale_loss_weight * min_scale_loss.mean()
+
+        if True:
+            mask = conf_vggt.reshape(-1) > 0.1
+            # depth_weight = (1.0 - get_img_grad_weight(render_pkg['rendered_distance']/(render_pkg["rendered_alpha"] + 1e-8)).clamp(0,1)).detach() ** 2 # (H, W)
+            depth_weight = (1.0 - get_img_grad_weight(depth_vggt)).clamp(0,1).detach() ** 2 # (H, W)
+            # depth_weight = (1.0 - get_img_grad_weight(render_pkg['plane_depth'])).clamp(0,1).detach() ** 2 # (H, W)
+            threshold = torch.mean(depth_weight.reshape(-1)[mask])
+            depth_weight[depth_weight < threshold] = 0.0
+            depth_weight[depth_weight >= threshold] = 1.0 # (H, W)
+            depth_weight = erode(depth_weight[None, None]).squeeze() # (H, W)
+
+            image_weight = (1.0 - get_img_grad_weight(gt_image))
+            image_weight = (image_weight).clamp(0,1).detach() ** 2
+
         # single-view loss
         if iteration > opt.single_view_weight_from_iter:
             weight = opt.single_view_weight
             normal = render_pkg["rendered_normal"]
             depth_normal = render_pkg["depth_normal"]
 
-            image_weight = (1.0 - get_img_grad_weight(gt_image))
-            image_weight = (image_weight).clamp(0,1).detach() ** 2
             if not opt.wo_image_weight:
                 # image_weight = erode(image_weight[None,None]).squeeze()
                 normal_loss = weight * (image_weight * (((depth_normal - normal)).abs().sum(0))).mean()
             else:
                 normal_loss = weight * (((depth_normal - normal)).abs().sum(0)).mean()
             loss += (normal_loss)
+
+        if conf_vggt is not None and normal_vggt is not None and iteration > 7000 and use_mv:
+            mask = conf_vggt.reshape(-1) > 0.8 
+            if iteration > 15000:
+                anchor_normal = render_normal(viewpoint_cam, render_pkg["plane_depth"].squeeze()) # (3, H, W)
+            else:
+                anchor_normal = render_pkg["rendered_normal"] / (render_pkg["rendered_alpha"].detach() + 1e-8) # (3, H, W)
+
+            R = get_rotation(anchor_normal.permute(1, 2, 0).reshape(-1, 3)[mask], normal_vggt.permute(1, 2, 0).reshape(-1, 3)[mask])
+            normal_vggt = (normal_vggt.permute(1, 2, 0) @ R).permute(2, 0, 1) # (3, H, W)
+            # normal_vggt /= (normal_vggt.norm(dim=0, keepdim=True)) # normalize
+            normal_loss_vggt = (1 - (anchor_normal * normal_vggt.detach()).sum(0).abs()) * conf_vggt.squeeze() # (H, W)
+            uncertainty_mask = torch.ones_like(normal_loss_vggt)
+
+            if iteration < 15000:
+                uncertainty_mask[conf_vggt.squeeze() < 1.0 - 0.2 * iteration / 10000] = 0.0
+                vggt_weight = 10
+            else:
+                uncertainty_mask[conf_vggt.squeeze() < 0.4 + 0.2 * iteration / 10000] = 0.0 ## tend to add new points
+                vggt_weight = 10
+            vggt_loss = vggt_weight * (normal_loss_vggt * uncertainty_mask * depth_weight).mean()
+            # loss += vggt_loss
 
         # multi-view loss
         if iteration > opt.multi_view_weight_from_iter:
@@ -315,7 +358,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                         grid = patch_warp(H_ref_to_neareast.reshape(-1,3,3), ori_pixels_patch)
                         grid[:, :, 0] = 2 * grid[:, :, 0] / (W - 1) - 1.0
                         grid[:, :, 1] = 2 * grid[:, :, 1] / (H - 1) - 1.0
-                        _, nearest_image_gray = nearest_cam.get_image()
+                        _, nearest_image_gray, _, _, _, _ = nearest_cam.get_image()
                         sampled_gray_val = F.grid_sample(nearest_image_gray[None], grid.reshape(1, -1, 1, 2), align_corners=True)
                         sampled_gray_val = sampled_gray_val.reshape(-1, total_patch_size)
                         
@@ -447,7 +490,7 @@ def training_report(tb_writer, iteration, Ll1, loss, l1_loss, elapsed, testing_i
                     if 'app_image' in out:
                         image = out['app_image']
                     image = torch.clamp(image, 0.0, 1.0)
-                    gt_image, _ = viewpoint.get_image()
+                    gt_image, _ , _, _, _, _= viewpoint.get_image()
                     gt_image = torch.clamp(gt_image.to("cuda"), 0.0, 1.0)
                     if tb_writer and (idx < 5):
                         tb_writer.add_images(config['name'] + "_view_{}/render".format(viewpoint.image_name), image[None], global_step=iteration)
